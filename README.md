@@ -29,6 +29,7 @@ node download.js --limit 10
 ```
 
 图片保存在 `./downloads/` 目录下。
+若遇到同名图片，后续文件会自动命名为 `xxx(2).png`、`xxx(3).png`，并按该名称判断是否跳过。
 
 ## 配置
 

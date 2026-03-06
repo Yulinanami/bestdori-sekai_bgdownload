@@ -40,15 +40,20 @@ function sleep(ms) {
 /**
  * 调用 S3 ListObjectsV2 API 获取目录内容
  */
-async function listObjects(prefix, continuationToken) {
+async function listObjects(prefix, continuationToken, delimiter = "/", startAfter) {
   const params = {
     "list-type": "2",
-    delimiter: "/",
     "max-keys": MAX_KEYS,
     prefix,
   };
+  if (delimiter) {
+    params.delimiter = delimiter;
+  }
   if (continuationToken) {
     params["continuation-token"] = continuationToken;
+  }
+  if (startAfter) {
+    params["start-after"] = startAfter;
   }
 
   const response = await httpClient.get(`${BASE_URL}/`, {
@@ -60,21 +65,32 @@ async function listObjects(prefix, continuationToken) {
 }
 
 /**
- * 获取指定前缀下的所有子目录（支持分页）
+ * 获取指定前缀下的所有子目录（使用 start-after 分页，避开源站 continuation-token 缺陷）
  */
 async function getAllSubDirs(prefix) {
   const dirs = [];
-  let token = undefined;
+  let startAfter = undefined;
 
   do {
-    const result = await listObjects(prefix, token);
+    const result = await listObjects(prefix, undefined, "/", startAfter);
+    const pageDirs = [];
+
     if (result.CommonPrefixes) {
       for (const cp of result.CommonPrefixes) {
-        dirs.push(cp.Prefix);
+        const dirName = path.basename(cp.Prefix.slice(0, -1));
+        if (dirName.startsWith("bg")) {
+          dirs.push(cp.Prefix);
+          pageDirs.push(cp.Prefix);
+        }
       }
     }
-    token = result.NextContinuationToken;
-  } while (token);
+
+    const isTruncated = String(result.IsTruncated) === "true";
+    startAfter =
+      isTruncated && pageDirs.length > 0
+        ? pageDirs[pageDirs.length - 1]
+        : undefined;
+  } while (startAfter);
 
   return dirs;
 }
@@ -91,12 +107,58 @@ async function getPngFilesInDir(prefix) {
     if (result.Contents) {
       for (const content of result.Contents) {
         if (content.Key.endsWith(".png")) {
-          files.push(content.Key);
+          files.push({
+            key: content.Key,
+            size: Number(content.Size),
+          });
         }
       }
     }
     token = result.NextContinuationToken;
   } while (token);
+
+  return files;
+}
+
+function addDuplicateSuffix(fileName, index) {
+  const parsed = path.parse(fileName);
+  return `${parsed.name}(${index})${parsed.ext}`;
+}
+
+function assignFileNames(files) {
+  const reservedNames = new Set(
+    files.map((fileInfo) => path.basename(fileInfo.key)),
+  );
+  const generatedNames = new Set();
+  const groups = new Map();
+
+  for (const fileInfo of files) {
+    const fileName = path.basename(fileInfo.key);
+    if (!groups.has(fileName)) {
+      groups.set(fileName, []);
+    }
+    groups.get(fileName).push(fileInfo);
+  }
+
+  for (const [fileName, group] of groups) {
+    group.sort((a, b) => a.key.localeCompare(b.key));
+    group[0].file = fileName;
+
+    let suffix = 2;
+    for (let i = 1; i < group.length; i++) {
+      let nextFileName = addDuplicateSuffix(fileName, suffix);
+      while (
+        reservedNames.has(nextFileName) ||
+        generatedNames.has(nextFileName)
+      ) {
+        suffix++;
+        nextFileName = addDuplicateSuffix(fileName, suffix);
+      }
+      group[i].file = nextFileName;
+      generatedNames.add(nextFileName);
+      suffix++;
+    }
+  }
 
   return files;
 }
@@ -121,7 +183,6 @@ async function getAllPngFiles() {
     );
   }
 
-  // 并发池扫描目录
   const pool = [];
   let dirIndex = 0;
 
@@ -147,7 +208,7 @@ async function getAllPngFiles() {
   printScanProgress();
   console.log(""); // 换行
 
-  return allFiles;
+  return assignFileNames(allFiles);
 }
 
 // 下载逻辑
@@ -155,20 +216,26 @@ async function getAllPngFiles() {
 /**
  * 下载单个文件（支持重试）
  */
-async function downloadFile(fileKey, retries = 0) {
-  const fileName = path.basename(fileKey);
+async function downloadFile(fileInfo, retries = 0) {
+  const fileName = fileInfo.file;
   const filePath = path.join(OUTPUT_DIR, fileName);
   const tmpPath = filePath + ".tmp";
 
   // 跳过已下载的文件
   if (fs.existsSync(filePath)) {
-    if (fs.statSync(filePath).size > 0) {
-      return { status: "skipped", file: fileName, key: fileKey };
+    const localSize = fs.statSync(filePath).size;
+    if (localSize === fileInfo.size) {
+      return {
+        status: "skipped",
+        file: fileName,
+        localSize,
+        size: fileInfo.size,
+      };
     }
   }
 
   try {
-    const url = `${BASE_URL}/${fileKey}`;
+    const url = `${BASE_URL}/${fileInfo.key}`;
     const response = await httpClient.get(url, { responseType: "stream" });
 
     // 使用临时文件写入，完成后再重命名（避免部分下载的文件）
@@ -176,7 +243,7 @@ async function downloadFile(fileKey, retries = 0) {
     await pipeline(response.data, writer);
     fs.renameSync(tmpPath, filePath);
 
-    return { status: "downloaded", file: fileName, key: fileKey };
+    return { status: "downloaded" };
   } catch (err) {
     if (fs.existsSync(tmpPath)) {
       try {
@@ -187,9 +254,16 @@ async function downloadFile(fileKey, retries = 0) {
     if (retries < MAX_RETRIES) {
       // 等待一段时间后重试
       await sleep(1000 * (retries + 1) + Math.floor(Math.random() * 500));
-      return downloadFile(fileKey, retries + 1);
+      return downloadFile(fileInfo, retries + 1);
     }
-    return { status: "failed", file: fileName, key: fileKey, error: err.message };
+
+    return {
+      status: "failed",
+      file: fileName,
+      key: fileInfo.key,
+      size: fileInfo.size,
+      error: err.message,
+    };
   }
 }
 
@@ -211,11 +285,11 @@ async function retryFailedFiles(failedFiles) {
     if (index >= failedFiles.length) return Promise.resolve();
     const currentFile = failedFiles[index++];
 
-    return downloadFile(currentFile.key).then((result) => {
+    return downloadFile(currentFile).then((result) => {
       if (result.status === "downloaded") downloaded++;
       else if (result.status === "skipped") {
         skipped++;
-        skippedFiles.push(result.file);
+        skippedFiles.push(result);
       }
       else remainingFailedFiles.push(result);
       return next();
@@ -256,14 +330,14 @@ async function downloadAll(fileKeys) {
   function next() {
     if (index >= total) return Promise.resolve();
     const currentIndex = index++;
-    const key = fileKeys[currentIndex];
+    const fileInfo = fileKeys[currentIndex];
 
-    return downloadFile(key).then((result) => {
+    return downloadFile(fileInfo).then((result) => {
       completed++;
       if (result.status === "downloaded") downloaded++;
       else if (result.status === "skipped") {
         skipped++;
-        skippedFiles.push(result.file);
+        skippedFiles.push(result);
       }
       else if (result.status === "failed") {
         failed++;
@@ -341,7 +415,9 @@ async function main() {
   if (result.skippedFiles.length > 0) {
     console.log("\n已跳过文件列表:");
     for (const file of result.skippedFiles) {
-      console.log(`  - ${file}`);
+      console.log(
+        `  - ${file.file} (本地: ${file.localSize} bytes, 远端: ${file.size} bytes)`,
+      );
     }
   }
 
