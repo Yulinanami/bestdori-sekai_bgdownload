@@ -1,0 +1,90 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runner: ubuntu-latest
+            target: node18-linux-x64
+            output_suffix: Linux_x64
+            output_extension: ""
+          - name: macOS
+            runner: macos-latest
+            target: node18-macos-x64
+            output_suffix: macOS_x64
+            output_extension: ""
+          - name: Windows
+            runner: windows-latest
+            target: node18-win-x64
+            output_suffix: Windows_x64
+            output_extension: ".exe"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "ver=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "ver=v0.0.0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build names
+        id: names
+        shell: bash
+        run: |
+          echo "artifact_name=Sekai_BG_ImgDownload_${{ steps.version.outputs.ver }}_${{ matrix.output_suffix }}" >> $GITHUB_OUTPUT
+          echo "artifact_path=Sekai_BG_ImgDownload_${{ steps.version.outputs.ver }}_${{ matrix.output_suffix }}${{ matrix.output_extension }}" >> $GITHUB_OUTPUT
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install pkg
+        run: npm install -g pkg
+
+      - name: Build executable
+        run: pkg download.js --target ${{ matrix.target }} --output ${{ steps.names.outputs.artifact_path }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.names.outputs.artifact_name }}
+          path: ${{ steps.names.outputs.artifact_path }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true

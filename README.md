@@ -36,8 +36,8 @@ node download.js --limit 10
 
 | 参数          | 默认值        | 说明         |
 | ------------- | ------------- | ------------ |
-| `CONCURRENCY` | 15            | 下载并发数   |
-| `MAX_RETRIES` | 3             | 失败重试次数 |
+| `CONCURRENCY` | 8             | 下载并发数   |
+| `MAX_RETRIES` | 5             | 失败重试次数 |
 | `OUTPUT_DIR`  | `./downloads` | 输出目录     |
 
 ## 技术栈

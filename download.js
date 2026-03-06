@@ -1,6 +1,7 @@
 const axios = require("axios");
 const { XMLParser } = require("fast-xml-parser");
 const fs = require("fs");
+const https = require("https");
 const path = require("path");
 const { pipeline } = require("stream/promises");
 
@@ -8,9 +9,20 @@ const { pipeline } = require("stream/promises");
 const BASE_URL = "https://storage.sekai.best/sekai-jp-assets";
 const PREFIX = "scenario/background/";
 const OUTPUT_DIR = path.join(process.cwd(), "downloads");
-const CONCURRENCY = 15; // 并发下载数
-const MAX_RETRIES = 3; // 最大重试次数
+const CONCURRENCY = 8; // 并发下载数
+const MAX_RETRIES = 5; // 最大重试次数
 const MAX_KEYS = 500; // 每次 API 请求返回的最大数量
+const REQUEST_TIMEOUT = 30000; // 单次请求超时时间
+const RETRY_CONCURRENCY = Math.max(3, Math.floor(CONCURRENCY / 3)); // 收尾重试并发数
+
+const httpClient = axios.create({
+  timeout: REQUEST_TIMEOUT,
+  httpsAgent: new https.Agent({
+    keepAlive: true,
+    maxSockets: CONCURRENCY,
+    maxFreeSockets: CONCURRENCY,
+  }),
+});
 
 // 命令行参数：--limit <数量> 限制下载数量（用于测试）
 const limitArg = process.argv.indexOf("--limit");
@@ -20,6 +32,10 @@ const DOWNLOAD_LIMIT =
 const parser = new XMLParser({
   isArray: (name) => ["CommonPrefixes", "Contents"].includes(name),
 });
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /**
  * 调用 S3 ListObjectsV2 API 获取目录内容
@@ -35,7 +51,7 @@ async function listObjects(prefix, continuationToken) {
     params["continuation-token"] = continuationToken;
   }
 
-  const response = await axios.get(`${BASE_URL}/`, {
+  const response = await httpClient.get(`${BASE_URL}/`, {
     params,
     responseType: "text",
   });
@@ -142,31 +158,77 @@ async function getAllPngFiles() {
 async function downloadFile(fileKey, retries = 0) {
   const fileName = path.basename(fileKey);
   const filePath = path.join(OUTPUT_DIR, fileName);
+  const tmpPath = filePath + ".tmp";
 
   // 跳过已下载的文件
   if (fs.existsSync(filePath)) {
-    return { status: "skipped", file: fileName };
+    if (fs.statSync(filePath).size > 0) {
+      return { status: "skipped", file: fileName, key: fileKey };
+    }
   }
 
   try {
     const url = `${BASE_URL}/${fileKey}`;
-    const response = await axios.get(url, { responseType: "stream" });
+    const response = await httpClient.get(url, { responseType: "stream" });
 
     // 使用临时文件写入，完成后再重命名（避免部分下载的文件）
-    const tmpPath = filePath + ".tmp";
     const writer = fs.createWriteStream(tmpPath);
     await pipeline(response.data, writer);
     fs.renameSync(tmpPath, filePath);
 
-    return { status: "downloaded", file: fileName };
+    return { status: "downloaded", file: fileName, key: fileKey };
   } catch (err) {
+    if (fs.existsSync(tmpPath)) {
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch (unlinkErr) {}
+    }
+
     if (retries < MAX_RETRIES) {
       // 等待一段时间后重试
-      await new Promise((r) => setTimeout(r, 1000 * (retries + 1)));
+      await sleep(1000 * (retries + 1) + Math.floor(Math.random() * 500));
       return downloadFile(fileKey, retries + 1);
     }
-    return { status: "failed", file: fileName, error: err.message };
+    return { status: "failed", file: fileName, key: fileKey, error: err.message };
   }
+}
+
+async function retryFailedFiles(failedFiles) {
+  if (failedFiles.length === 0) {
+    return { downloaded: 0, skipped: 0, skippedFiles: [], failedFiles: [] };
+  }
+
+  await sleep(2000);
+
+  let downloaded = 0;
+  let skipped = 0;
+  const skippedFiles = [];
+  const remainingFailedFiles = [];
+  const pool = [];
+  let index = 0;
+
+  function next() {
+    if (index >= failedFiles.length) return Promise.resolve();
+    const currentFile = failedFiles[index++];
+
+    return downloadFile(currentFile.key).then((result) => {
+      if (result.status === "downloaded") downloaded++;
+      else if (result.status === "skipped") {
+        skipped++;
+        skippedFiles.push(result.file);
+      }
+      else remainingFailedFiles.push(result);
+      return next();
+    });
+  }
+
+  for (let i = 0; i < Math.min(RETRY_CONCURRENCY, failedFiles.length); i++) {
+    pool.push(next());
+  }
+
+  await Promise.all(pool);
+
+  return { downloaded, skipped, skippedFiles, failedFiles: remainingFailedFiles };
 }
 
 /**
@@ -178,7 +240,8 @@ async function downloadAll(fileKeys) {
   let skipped = 0;
   let failed = 0;
   const total = fileKeys.length;
-  const failedFiles = [];
+  const skippedFiles = [];
+  let failedFiles = [];
 
   function printProgress() {
     process.stdout.write(
@@ -198,7 +261,10 @@ async function downloadAll(fileKeys) {
     return downloadFile(key).then((result) => {
       completed++;
       if (result.status === "downloaded") downloaded++;
-      else if (result.status === "skipped") skipped++;
+      else if (result.status === "skipped") {
+        skipped++;
+        skippedFiles.push(result.file);
+      }
       else if (result.status === "failed") {
         failed++;
         failedFiles.push(result);
@@ -214,9 +280,20 @@ async function downloadAll(fileKeys) {
   }
 
   await Promise.all(pool);
+
+  if (failedFiles.length > 0) {
+    const retryResult = await retryFailedFiles(failedFiles);
+    downloaded += retryResult.downloaded;
+    skipped += retryResult.skipped;
+    skippedFiles.push(...retryResult.skippedFiles);
+    failedFiles = retryResult.failedFiles;
+    failed = failedFiles.length;
+    printProgress();
+  }
+
   console.log(""); // 换行
 
-  return { downloaded, skipped, failed, failedFiles };
+  return { downloaded, skipped, skippedFiles, failed, failedFiles };
 }
 
 // 主流程
@@ -260,6 +337,13 @@ async function main() {
   console.log(`  成功下载: ${result.downloaded}`);
   console.log(`  已跳过: ${result.skipped}`);
   console.log(`  下载失败: ${result.failed}`);
+
+  if (result.skippedFiles.length > 0) {
+    console.log("\n已跳过文件列表:");
+    for (const file of result.skippedFiles) {
+      console.log(`  - ${file}`);
+    }
+  }
 
   if (result.failedFiles.length > 0) {
     console.log("\n失败文件列表:");
