@@ -1,10 +1,9 @@
-# Sekai 背景图批量下载工具
+# Bestdori & Sekai背景图下载器🎸
 
-从 [Sekai Viewer](https://sekai.best/asset_viewer/scenario/background) 批量下载 Project Sekai 的背景图（PNG 格式）。
+从 [Bestdori](https://bestdori.com) 和 [Sekai Viewer](https://sekai.best/asset_viewer/scenario/background) 批量下载背景图（PNG 格式）。
 
-## 原理
-
-直接调用 Sekai Viewer 的 S3/MinIO 存储 API
+## 运行环境
+- Node.js 18+
 
 ## 使用方法
 
@@ -14,32 +13,45 @@
 npm install
 ```
 
-### 下载所有背景图
+### 启动下载
 
 ```bash
 node download.js
 ```
 
-### 限制下载数量（测试用）
-
-```bash
-node download.js --limit 10
-```
-
-图片保存在 `./downloads/` 目录下。
-若遇到同名图片，后续文件会自动命名为 `xxx(2).png`、`xxx(3).png`，并按该名称判断是否跳过。
+图片分别保存在 `bg/bestdori/` 和 `bg/sekai/` 目录下。
 
 ## 配置
 
-编辑 `download.js` 顶部的常量即可修改：
+编辑对应模块文件即可修改参数：
 
-| 参数          | 默认值        | 说明         |
-| ------------- | ------------- | ------------ |
-| `CONCURRENCY` | 8             | 下载并发数   |
-| `MAX_RETRIES` | 5             | 失败重试次数 |
-| `OUTPUT_DIR`  | `./downloads` | 输出目录     |
+| 参数                  | 默认值 | 文件              | 说明                       |
+| --------------------- | ------ | ----------------- | -------------------------- |
+| `CONCURRENCY`         | 8      | `src/common.js`   | 下载并发数                 |
+| `MAX_RETRIES`         | 5      | `src/common.js`   | 单文件最大重试次数         |
+| `RETRY_FAILED_ROUNDS` | 5      | `src/common.js`   | 失败文件补重试轮数         |
+| `DEFAULT_START`       | 0      | `src/bestdori.js` | Bestdori 默认起始 scenario |
+| `DEFAULT_END`         | 391    | `src/bestdori.js` | Bestdori 默认结束 scenario |
+
+## 项目结构
+
+```
+├── download.js          # 主入口（选择下载源）
+├── src/
+│   ├── common.js        # 共用工具（下载引擎、进度条、重试）
+│   ├── bestdori.js      # Bestdori 下载逻辑
+│   └── sekai.js         # Sekai 下载逻辑
+└── bg/
+    ├── bestdori/        # Bestdori 背景图输出
+    └── sekai/           # Sekai 背景图输出
+```
 
 ## 技术栈
 
 - [axios](https://github.com/axios/axios) — HTTP 请求
-- [fast-xml-parser](https://github.com/NaturalIntelligence/fast-xml-parser) — S3 XML 响应解析
+- [cli-progress](https://github.com/npkgz/cli-progress) — 终端进度条
+- [fast-xml-parser](https://github.com/NaturalIntelligence/fast-xml-parser) — S3 XML 响应解析（Sekai）
+
+## 📄 许可证
+
+MIT License

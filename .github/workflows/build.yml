@@ -50,8 +50,8 @@ jobs:
         id: names
         shell: bash
         run: |
-          echo "artifact_name=Sekai_BG_ImgDownload_${{ steps.version.outputs.ver }}_${{ matrix.output_suffix }}" >> $GITHUB_OUTPUT
-          echo "artifact_path=Sekai_BG_ImgDownload_${{ steps.version.outputs.ver }}_${{ matrix.output_suffix }}${{ matrix.output_extension }}" >> $GITHUB_OUTPUT
+          echo "artifact_name=BG_ImgDownload_${{ steps.version.outputs.ver }}_${{ matrix.output_suffix }}" >> $GITHUB_OUTPUT
+          echo "artifact_path=BG_ImgDownload_${{ steps.version.outputs.ver }}_${{ matrix.output_suffix }}${{ matrix.output_extension }}" >> $GITHUB_OUTPUT
 
       - uses: actions/setup-node@v4
         with:

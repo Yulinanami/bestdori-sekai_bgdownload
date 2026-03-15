@@ -1,10 +1,10 @@
 {
-  "name": "sekai_bg_imgdownload",
+  "name": "bg_imgdownload",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Bestdori / Sekai 背景图批量下载工具",
+  "main": "download.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node download.js"
   },
   "keywords": [],
   "author": "",
