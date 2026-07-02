@@ -1,12 +1,14 @@
 const { XMLParser } = require("fast-xml-parser");
 const path = require("path");
-const { httpClient, colorize, createProgressBar, downloadAll } = require("./common");
+const { httpClient, colorize, sleep, createProgressBar, downloadAll } = require("./common");
 
 // Sekai 配置
 const BASE_URL = "https://storage.sekai.best/sekai-jp-assets";
 const PREFIX = "scenario/background/";
 const MAX_KEYS = 500;
 const SCAN_CONCURRENCY = 10;
+const SCAN_MAX_RETRIES = 3;
+const SCAN_RETRY_FAILED_ROUNDS = 2;
 
 const parser = new XMLParser({
   isArray: (name) => ["CommonPrefixes", "Contents"].includes(name),
@@ -89,6 +91,50 @@ async function getPngFilesInDir(prefix) {
   return files;
 }
 
+// 扫描目录失败时重试，避免 Wi-Fi 偶发超时中断整个流程
+async function getPngFilesInDirWithRetry(prefix, retries = 0) {
+  try {
+    return await getPngFilesInDir(prefix);
+  } catch (err) {
+    if (retries < SCAN_MAX_RETRIES) {
+      await sleep(1000 * (retries + 1) + Math.floor(Math.random() * 500));
+      return getPngFilesInDirWithRetry(prefix, retries + 1);
+    }
+    throw err;
+  }
+}
+
+// 按固定并发扫描目录；单个目录失败先记录，后面统一补重试
+async function scanDirList(dirs, allFiles, onScanned) {
+  const failedDirs = [];
+  const pool = [];
+  let dirIndex = 0;
+
+  function nextScan() {
+    if (dirIndex >= dirs.length) return Promise.resolve();
+    const currentDir = dirs[dirIndex++];
+
+    return getPngFilesInDirWithRetry(currentDir)
+      .then((files) => {
+        allFiles.push(...files);
+      })
+      .catch((err) => {
+        failedDirs.push({ dir: currentDir, error: err.message });
+      })
+      .then(() => {
+        if (onScanned) onScanned();
+        return nextScan();
+      });
+  }
+
+  for (let i = 0; i < Math.min(SCAN_CONCURRENCY, dirs.length); i++) {
+    pool.push(nextScan());
+  }
+  await Promise.all(pool);
+
+  return failedDirs;
+}
+
 // 文件重名了就加个序号，比如 xxx(2).png
 function addDuplicateSuffix(fileName, index) {
   const parsed = path.parse(fileName);
@@ -145,35 +191,32 @@ async function getAllPngFiles() {
 
   const scanBar = createProgressBar(`${colorize(36, "   扫描: {bar}")} ${colorize(33, "{percentage}%")} | ${colorize(33, "{value}/{total}")} | 已找到 ${colorize(32, "{found}")} 个 PNG 文件 | 用时 ${colorize(35, "{duration_formatted}")} | 剩余 ${colorize(36, "{eta_formatted}")}`);
 
-  const pool = [];
-  let dirIndex = 0;
-
   if (total > 0) {
     scanBar.start(total, 0, { found: 0 });
   }
 
-  // 取下一个文件夹去扫描
-  function nextScan() {
-    if (dirIndex >= total) return Promise.resolve();
-    const currentDir = subDirs[dirIndex++];
-
-    return getPngFilesInDir(currentDir).then((files) => {
-      allFiles.push(...files);
-      scanned++;
-      if (total > 0) {
-        scanBar.update(scanned, { found: allFiles.length });
-      }
-      return nextScan();
-    });
-  }
-
-  for (let i = 0; i < Math.min(SCAN_CONCURRENCY, total); i++) {
-    pool.push(nextScan());
-  }
-  await Promise.all(pool);
+  let failedDirs = await scanDirList(subDirs, allFiles, () => {
+    scanned++;
+    if (total > 0) {
+      scanBar.update(scanned, { found: allFiles.length });
+    }
+  });
 
   if (total > 0) {
     scanBar.stop();
+  }
+
+  for (let round = 1; round <= SCAN_RETRY_FAILED_ROUNDS && failedDirs.length > 0; round++) {
+    console.log(`\n有 ${failedDirs.length} 个目录扫描失败，开始补重试 ${round}/${SCAN_RETRY_FAILED_ROUNDS}...`);
+    failedDirs = await scanDirList(failedDirs.map((item) => item.dir), allFiles);
+  }
+
+  if (failedDirs.length > 0) {
+    console.log("\n扫描失败目录:");
+    for (const item of failedDirs) {
+      console.log(`  - ${item.dir}: ${item.error}`);
+    }
+    throw new Error(`还有 ${failedDirs.length} 个目录扫描失败`);
   }
 
   return assignFileNames(allFiles);
